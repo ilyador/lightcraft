@@ -8,7 +8,7 @@ use lightcraft_color::{D50, D65, Mat3, PROPHOTO, REC2020, bradford, luminance_20
 use lightcraft_pipeline::tone::{CameraTone, ToneMap};
 use lightcraft_raster::{
     Rgb32f,
-    resample::{Filter, fit},
+    resample::{Filter, fit, resize},
 };
 use lightcraft_raw::{RawFormat, RawImage, color::CameraTransform, profile::HsvTable};
 
@@ -86,7 +86,7 @@ fn proxies(raw: &RawImage, bytes: &[u8], transform: &CameraTransform, size: usiz
     let k = (crop.width.max(crop.height).div_ceil(edge as usize).max(2)).div_ceil(2) * 2;
     let sensor = sensor_proxy(raw, k, edge as usize)?;
     let mut sensor = fit(&sensor, size, size, Filter::Box);
-    let reference = fit(&reference, sensor.width, sensor.height, Filter::Box);
+    let reference = resize(&reference, sensor.width, sensor.height, Filter::Box);
     let gain = 2f32.powf(transform.baseline_exposure as f32);
     sensor.map_in_place(|p| transform.matrix.apply_f32(std::array::from_fn(|i| p[i] * transform.wb[i] * gain)));
     Some((sensor, reference))
@@ -558,6 +558,51 @@ mod tests {
         raw.data = RawData::F32(Vec::new());
         assert!(sensor_proxy(&raw, 2, 384).is_none());
     }
+    #[test]
+    fn tolerated_jpeg_aspect_difference_keeps_matching_calibration_samples() {
+        use lightcraft_codecs::{ChromaSubsampling, EncodeImage, EncodeMeta};
+        use lightcraft_raster::Rgba8;
+        use lightcraft_raw::{BlackLevel, ColorData, OpcodeLists, Orientation, RawData, Rect};
+        // Sensor borders make the RAW slightly wider than its camera JPEG,
+        // within proxies' existing 2% tolerance (as on Nikon D7000 files).
+        let raw = RawImage {
+            format: RawFormat::Nef,
+            width: 194,
+            height: 128,
+            cpp: 3,
+            data: RawData::F32([0.2, 0.3, 0.4].repeat(194 * 128)),
+            cfa: None,
+            bits: 16,
+            black: BlackLevel::uniform(0.0),
+            white: vec![1.0],
+            active_area: Rect::new(0, 0, 194, 128),
+            crop: Rect::new(0, 0, 194, 128),
+            orientation: Orientation::Normal,
+            color: ColorData::default(),
+            wb_multipliers: Some([1.0; 3]),
+            linearized: true,
+            opcodes: OpcodeLists::default(),
+            metadata: lightcraft_meta::Metadata::default(),
+        };
+        let pixels = Rgba8::filled(192, 128, [80, 120, 160, 255]);
+        let jpeg = lightcraft_codecs::encode_jpeg(&EncodeImage::rgba8(&pixels), 90, ChromaSubsampling::S444, &EncodeMeta::default()).unwrap();
+        // Minimal TIFF wrapper with JPEGInterchangeFormat and Length tags.
+        let mut bytes = b"II\x2a\0\x08\0\0\0\x02\0".to_vec();
+        for (tag, value) in [(0x0201u16, 38u32), (0x0202, jpeg.len() as u32)] {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&4u16.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&jpeg);
+        let transform = lightcraft_raw::color::camera_transform(&raw, D65);
+        let (sensor, reference) = proxies(&raw, &bytes, &transform, PROXY).unwrap();
+        assert_eq!((sensor.width, sensor.height), (96, 63));
+        assert_eq!((reference.width, reference.height), (sensor.width, sensor.height));
+        assert!(collect_pairs(&sensor, &reference).is_some(), "accepted JPEG can supply calibration pairs");
+    }
+
     #[test]
     fn separates_nonlinear_tone_from_colour_and_keeps_sensor_headroom() {
         let known = Mat3([[1.8, -0.4, -0.1], [-0.2, 1.5, -0.1], [-0.05, -0.3, 1.7]]);
