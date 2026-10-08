@@ -3019,6 +3019,7 @@ name = "lightcraft-raw"
 version = "0.3.0"
 dependencies = [
  "jpeg-encoder",
+ "jxl-oxide",
  "lightcraft-color",
  "lightcraft-geom",
  "lightcraft-meta",

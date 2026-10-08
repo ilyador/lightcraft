@@ -106,7 +106,7 @@ names are read (e.g. `Exposure2012`, not the older `Exposure`).
 |---|---|---|
 | `Exposure2012` | `light.exposure` | EV, 1:1 |
 | `Contrast2012`, `Highlights2012`, `Shadows2012`, `Whites2012`, `Blacks2012` | `light.contrast` … `light.blacks` | −100..100, 1:1 |
-| `WhiteBalance` | `wb.mode` | `As Shot`, `Auto`, `Daylight`, `Cloudy`, `Shade`, `Tungsten`, `Fluorescent`, `Flash`; other names → custom |
+| `WhiteBalance` | `wb.mode` | As Shot keeps the source white point. Other modes retain saved Temperature/Tint as custom values when present; without values, named presets resolve normally. |
 | `Temperature`, `Tint` | `wb.temp`, `wb.tint` | Kelvin / tint for raw files (and presets) |
 | `IncrementalTemperature`, `IncrementalTint` | `wb.temp`, `wb.tint` | rendered files: −100..100 on our relative scale (mired shift around 6500 K, same as the Temp slider) |
 | `Vibrance`, `Saturation` | `color.vibrance`, `color.saturation` | 1:1 |
@@ -135,6 +135,8 @@ names are read (e.g. `Exposure2012`, not the older `Exposure`).
 | `PerspectiveVertical/Horizontal/Rotate/Scale/Aspect/X/Y` | `geometry.vertical/horizontal/rotate/scale/aspect/offset_x/offset_y` | |
 | `PerspectiveUpright` | `geometry.upright` | 0 off, 1 auto, 2 level, 3 vertical, 4 full, 5 guided |
 | `HasCrop`, `CropLeft/Top/Right/Bottom`, `CropAngle` | `crop.geometry` | normalized edges → rect; angle in degrees; `HasCrop="False"` → no crop |
+
+Panel `Enable*` switches remain in the unmapped report: their exact saved-packet panel scope has not been verified, so the importer preserves supported slider values and reports those switches instead of guessing which groups to reset.
 
 Values pass through our control specs, so anything outside our slider ranges gets clamped.
 

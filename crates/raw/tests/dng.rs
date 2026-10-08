@@ -548,3 +548,41 @@ fn malformed_profile_look_tags_are_ignored() {
     let plain = decode(&profile_dng(ByteOrder::Little, |_| {})).unwrap();
     assert!(plain.color.profile.is_empty());
 }
+
+#[test]
+fn enhanced_image_uses_own_samples_and_inherits_camera_and_scaled_framing() {
+    let mut original = base_ifd(4, 4, 16, 1, true);
+    original.set(t::NEW_SUBFILE_TYPE, Value::Long(vec![0]));
+    original.set(t::ACTIVE_AREA, Value::Long(vec![1, 1, 3, 3]));
+    original.set(t::DEFAULT_CROP_ORIGIN, Value::Rational(vec![(0, 1), (0, 1)]));
+    original.set(t::DEFAULT_CROP_SIZE, Value::Rational(vec![(2, 1), (2, 1)]));
+    original.set(t::AS_SHOT_NEUTRAL, Value::Rational(vec![(2, 5), (1, 1), (7, 10)]));
+    original.set(t::BASELINE_EXPOSURE, Value::SRational(vec![(1, 2)]));
+    original.set(t::BLACK_LEVEL, Value::Rational(vec![(100, 1)]));
+    original.set(t::WHITE_LEVEL, Value::Long(vec![16000]));
+    original
+        .set(t::OPCODE_LIST_1, Value::Undefined(lightcraft_raw::opcodes::write_list(&[Opcode::TrimBounds { top: 0, left: 0, bottom: 4, right: 4 }])));
+    original.set_image(ImageData::Strips { rows_per_strip: 4, strips: vec![u16_bytes(&[200; 16], ByteOrder::Little)] });
+    let mut enhanced = base_ifd(8, 8, 16, 3, false);
+    enhanced.set(t::NEW_SUBFILE_TYPE, Value::Long(vec![16]));
+    enhanced.set(t::BLACK_LEVEL, Value::Rational(vec![(2048, 1)]));
+    enhanced.set(t::WHITE_LEVEL, Value::Long(vec![62000]));
+    enhanced.set(t::BASELINE_EXPOSURE, Value::SRational(vec![(-1, 1)]));
+    enhanced.set_image(ImageData::Strips { rows_per_strip: 8, strips: vec![u16_bytes(&[50000; 192], ByteOrder::Little)] });
+    let bytes = dng_with(original, ByteOrder::Little, |ifd0| {
+        ifd0.add_sub_ifd(enhanced);
+    });
+    assert!(lightcraft_raw::is_enhanced_dng(&bytes));
+    let raw = decode(&bytes).unwrap();
+    assert_eq!((raw.width, raw.height, raw.cpp), (8, 8, 3));
+    assert!(raw.cfa.is_none());
+    assert_eq!(raw.data, RawData::U16(vec![50000; 192]));
+    assert_eq!(raw.active_area, Rect::new(2, 2, 4, 4));
+    assert_eq!(raw.crop, Rect::new(0, 0, 4, 4));
+    assert_eq!(raw.black.values, vec![2048.0]);
+    assert_eq!(raw.white, vec![62000.0]);
+    assert_eq!(raw.color.as_shot_neutral, Some([0.4, 1.0, 0.7]));
+    assert_eq!(raw.color.baseline_exposure, -1.0);
+    assert!(raw.opcodes.list1.is_empty());
+    assert_eq!(lightcraft_raw::probe_info(&bytes).unwrap(), raw.info());
+}

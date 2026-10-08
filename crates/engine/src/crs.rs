@@ -195,9 +195,11 @@ pub fn to_partial(props: &Props, raw: Option<bool>) -> Value {
         None => abs.or(rel),
     };
     match (mode, wb) {
-        (Some(m), _) if m != "custom" => put(o, "wb.mode", json!(m)),
-        (m, Some((t, tint))) => {
-            put(o, "wb.mode", json!(m.unwrap_or("custom")));
+        (Some("asShot"), _) => put(o, "wb.mode", json!("asShot")),
+        (_, Some((t, tint))) => {
+            // Named/Auto modes also store the resolved camera-dependent white point. Preserve
+            // that result instead of resolving our different preset or auto algorithm again.
+            put(o, "wb.mode", json!("custom"));
             put(o, "wb.temp", json!(t));
             if let Some(tint) = tint {
                 put(o, "wb.tint", json!(tint));
@@ -374,7 +376,7 @@ pub fn to_partial_report(props: &Props, values: Option<&crate::crs_masks::Values
         }
     }
     // fields that only switch a panel on/off or name things: not adjustments by themselves
-    let quiet = |k: &str| k.starts_with("Enable") || k.starts_with("ToneCurveName") || k == "AutoTone" || k == "AutoGrayscaleMix";
+    let quiet = |k: &str| k.starts_with("ToneCurveName") || k == "AutoTone" || k == "AutoGrayscaleMix";
     let mut unmapped: Vec<String> = props
         .keys()
         .filter(|k| k.starts_with("crs:"))
@@ -408,6 +410,32 @@ pub fn preset_from_xmp(xmp: &str, fallback_name: &str) -> Option<Preset> {
 mod tests {
     use super::*;
     use lightcraft_develop::{DevelopSettings, Upright, VignetteStyle, WbMode, apply_partial};
+
+    #[test]
+    fn saved_named_and_auto_white_balance_keep_resolved_numeric_values() {
+        for mode in ["Auto", "Daylight", "Cloudy", "Shade", "Tungsten", "Fluorescent", "Flash", "Custom"] {
+            let p = props(&format!(
+                r#"<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:WhiteBalance="{mode}" crs:Temperature="5275" crs:Tint="13"/>"#
+            ));
+            let settings = apply_partial(&DevelopSettings::default(), &to_partial(&p, Some(true)), 1.0);
+            assert_eq!(settings.wb.mode, WbMode::Custom);
+            assert_eq!((settings.wb.temp, settings.wb.tint), (5275.0, 13.0));
+        }
+    }
+
+    #[test]
+    fn panel_enable_switches_remain_reported_without_unverified_resets() {
+        let p = props(
+            r#"<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:EnableToneCurve="false" crs:ParametricShadows="80" crs:EnableDetail="False" crs:Sharpness="90" crs:EnableEffects="false" crs:GrainAmount="80" crs:Clarity2012="20" crs:EnableMystery="false"/>"#,
+        );
+        let (partial, unmapped) = to_partial_report(&p, None, Some(true), 1.5);
+        let settings = apply_partial(&DevelopSettings::default(), &partial, 1.0);
+        assert_eq!(settings.curve.shadows, 80.0);
+        assert_eq!(settings.detail.sharpen_amount, 90.0);
+        assert_eq!(settings.grain.amount, 80.0);
+        assert_eq!(settings.effects.clarity, 20.0);
+        assert_eq!(unmapped, vec!["EnableDetail", "EnableEffects", "EnableMystery", "EnableToneCurve"]);
+    }
 
     /// A hand-written sidecar in attribute form (as many tools write it).
     const SIDECAR: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -517,7 +545,7 @@ mod tests {
         let x = r#"<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
              crs:WhiteBalance="Daylight" crs:Temperature="5500" crs:Tint="10" crs:AlreadyApplied="True"/>"#;
         let p = props(x);
-        assert_eq!(to_partial(&p, Some(true)), json!({"wb": {"mode": "daylight"}}));
+        assert_eq!(to_partial(&p, Some(true)), json!({"wb": {"mode": "custom", "temp": 5500.0, "tint": 10.0}}));
         assert!(!has_adjustments(&p));
         let bookkeeping = r#"<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
              xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Version="1" crs:HasSettings="True"/>"#;

@@ -9,13 +9,21 @@ use lightcraft_geom::Orientation;
 use lightcraft_tiff::tags::{self as t, photometric};
 use lightcraft_tiff::{Ifd, Tiff};
 
-/// The main raw IFD: full-resolution (NewSubfileType 0) CFA or LinearRaw image with the most pixels.
-pub(crate) fn raw_ifd(tiff: &Tiff) -> Option<&Ifd> {
+fn original_ifd(tiff: &Tiff) -> Option<&Ifd> {
     tiff.all_ifds()
         .into_iter()
         .filter(|i| i.u32(t::NEW_SUBFILE_TYPE).unwrap_or(0) == 0)
         .filter(|i| matches!(i.u16(t::PHOTOMETRIC), Some(photometric::CFA) | Some(photometric::LINEAR_RAW)))
         .max_by_key(|i| i.u64(t::IMAGE_WIDTH).unwrap_or(0).saturating_mul(i.u64(t::IMAGE_LENGTH).unwrap_or(0)))
+}
+
+/// Prefer the enhanced, demosaiced image (DNG 1.5), retaining the original only when no enhancement exists.
+pub(crate) fn raw_ifd(tiff: &Tiff) -> Option<&Ifd> {
+    tiff.all_ifds()
+        .into_iter()
+        .filter(|i| i.u32(t::NEW_SUBFILE_TYPE) == Some(16) && i.u16(t::PHOTOMETRIC) == Some(photometric::LINEAR_RAW))
+        .max_by_key(|i| i.u64(t::IMAGE_WIDTH).unwrap_or(0).saturating_mul(i.u64(t::IMAGE_LENGTH).unwrap_or(0)))
+        .or_else(|| original_ifd(tiff))
 }
 
 fn mat3(v: Option<Vec<f64>>) -> Option<Mat3> {
@@ -79,9 +87,6 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     if !(1..=4).contains(&cpp) {
         return Err(RawError::Unsupported(format!("{cpp} samples per pixel")));
     }
-    if info.compression == t::compression::JPEG_XL {
-        return Err(RawError::Unsupported("JPEG XL DNG".into()));
-    }
     let mut data = read_image_in(mode, bytes, &info, tiff.order, Packing::Msb)?;
     let bits = info.bits() as u32;
 
@@ -115,13 +120,43 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     let black =
         BlackLevel { repeat_rows: br, repeat_cols: bc, values, delta_h: floats(t::BLACK_LEVEL_DELTA_H), delta_v: floats(t::BLACK_LEVEL_DELTA_V) };
 
-    let active_area = match raw.u64s(t::ACTIVE_AREA).as_deref() {
+    // Enhanced pixels have their own encoding/black/white/opcodes, but share the original camera
+    // colour model and default framing. Scale inherited framing for super-resolution enhancements.
+    let original = (info.new_subfile_type == 16).then(|| original_ifd(&tiff)).flatten();
+    let shared = original.unwrap_or(raw);
+    let scaled = |tag| {
+        raw.f64s(tag).or_else(|| {
+            let (ow, oh) = (shared.u64(t::IMAGE_WIDTH)?, shared.u64(t::IMAGE_LENGTH)?);
+            if ow == 0 || oh == 0 {
+                return None;
+            }
+            let values = shared.f64s(tag)?;
+            let (sx, sy) = (w as f64 / ow as f64, h as f64 / oh as f64);
+            Some(
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        v * if tag == t::ACTIVE_AREA {
+                            if i % 2 == 0 { sy } else { sx }
+                        } else if i % 2 == 0 {
+                            sx
+                        } else {
+                            sy
+                        }
+                    })
+                    .collect(),
+            )
+        })
+    };
+    let active = scaled(t::ACTIVE_AREA).map(|v| v.into_iter().map(|n| n.round().max(0.0) as u64).collect::<Vec<_>>());
+    let active_area = match active.as_deref() {
         Some([top, left, bottom, right]) if bottom > top && right > left && (*bottom as usize) <= h && (*right as usize) <= w => {
             Rect::new(*left as usize, *top as usize, (*right - *left) as usize, (*bottom - *top) as usize)
         }
         _ => Rect::new(0, 0, w, h),
     };
-    let crop = match (raw.f64s(t::DEFAULT_CROP_ORIGIN).as_deref(), raw.f64s(t::DEFAULT_CROP_SIZE).as_deref()) {
+    let crop = match (scaled(t::DEFAULT_CROP_ORIGIN).as_deref(), scaled(t::DEFAULT_CROP_SIZE).as_deref()) {
         (Some([x, y]), Some([cw, ch])) if *cw >= 1.0 && *ch >= 1.0 && *x >= 0.0 && *y >= 0.0 => {
             Rect::new(x.round() as usize, y.round() as usize, cw.round() as usize, ch.round() as usize).clipped(active_area.width, active_area.height)
         }
@@ -162,6 +197,17 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     let mut metadata = lightcraft_meta::from_tiff(&tiff);
     metadata.width = Some(crop.width as u32);
     metadata.height = Some(crop.height as u32);
+    let mut calibration = shared.clone();
+    for entry in &raw.entries {
+        match calibration.entries.binary_search_by_key(&entry.tag, |e| e.tag) {
+            Ok(index) => {
+                if let Some(slot) = calibration.entries.get_mut(index) {
+                    *slot = entry.clone();
+                }
+            }
+            Err(index) => calibration.entries.insert(index, entry.clone()),
+        }
+    }
     let img = RawImage {
         format: RawFormat::Dng,
         width: w,
@@ -175,7 +221,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         active_area,
         crop,
         orientation: Orientation::from_exif(ifd0.u16(t::ORIENTATION).unwrap_or(1)),
-        color: color_data(ifd0, raw),
+        color: color_data(ifd0, &calibration),
         wb_multipliers: None,
         linearized,
         opcodes,
