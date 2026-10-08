@@ -64,8 +64,7 @@ pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransf
 fn proxies(raw: &RawImage, bytes: &[u8], transform: &CameraTransform, size: usize) -> Option<(Rgb32f, Rgb32f)> {
     let jpeg = lightcraft_raw::embedded_preview(bytes)?;
     let edge = (2 * size).max(384) as u32;
-    let decoded = lightcraft_codecs::decode(&jpeg, lightcraft_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: 64_000_000 }).ok()?;
-    let mut reference = decoded.to_working();
+    let mut reference = decode_preview(&jpeg, lightcraft_raw::embedded_preview_color_space(bytes), edge)?;
     let (a, crop) = (raw.active_area, raw.crop.clipped(raw.active_area.width, raw.active_area.height));
     if crop.width == 0 || crop.height == 0 || reference.width == 0 || reference.height == 0 {
         return None;
@@ -92,6 +91,20 @@ fn proxies(raw: &RawImage, bytes: &[u8], transform: &CameraTransform, size: usiz
     let gain = 2f32.powf(transform.baseline_exposure as f32);
     sensor.map_in_place(|p| transform.matrix.apply_f32(std::array::from_fn(|i| p[i] * transform.wb[i] * gain)));
     Some((sensor, reference))
+}
+
+fn decode_preview(jpeg: &[u8], hint: Option<lightcraft_raw::PreviewColorSpace>, edge: u32) -> Option<Rgb32f> {
+    let hint = hint.map(|space| match space {
+        lightcraft_raw::PreviewColorSpace::Srgb => lightcraft_codecs::NamedSpace::Srgb,
+        lightcraft_raw::PreviewColorSpace::AdobeRgb => lightcraft_codecs::NamedSpace::AdobeRgb,
+    });
+    let decoded = lightcraft_codecs::decode_jpeg_with_color_hint(
+        jpeg,
+        lightcraft_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: 64_000_000 },
+        hint,
+    )
+    .ok()?;
+    Some(decoded.to_working())
 }
 
 /// Colour training pairs of one raw for a camera profile: white-balanced camera RGB (with the
@@ -531,6 +544,80 @@ fn fit_tone(mut pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview_gradient(meta: lightcraft_codecs::EncodeMeta<'_>) -> Vec<u8> {
+        use lightcraft_codecs::{ChromaSubsampling, EncodeImage};
+        let mut pixels = lightcraft_raster::Rgba8::new(37, 29);
+        for (i, pixel) in pixels.data.iter_mut().enumerate() {
+            *pixel = [((i * 13 + 5) % 256) as u8, ((i * 7 + 35) % 256) as u8, ((i * 23 + 91) % 256) as u8, 255];
+        }
+        lightcraft_codecs::encode_jpeg(&EncodeImage::rgba8(&pixels), 100, ChromaSubsampling::S444, &meta).unwrap()
+    }
+
+    #[test]
+    fn camera_preview_adobe_hint_matches_explicit_icc_before_resizing() {
+        use lightcraft_codecs::{EncodeMeta, NamedSpace};
+        use lightcraft_raw::PreviewColorSpace;
+        let space = NamedSpace::AdobeRgb;
+        let icc = lightcraft_codecs::icc::write_matrix_trc(&space.rgb_space(), &space.trc());
+        let bare = preview_gradient(EncodeMeta::default());
+        let tagged = preview_gradient(EncodeMeta { icc: Some(&icc), ..Default::default() });
+        for edge in [64, 13, 5] {
+            let fallback = decode_preview(&bare, Some(PreviewColorSpace::AdobeRgb), edge).unwrap();
+            let explicit = decode_preview(&tagged, None, edge).unwrap();
+            assert_eq!((fallback.width, fallback.height), (explicit.width, explicit.height));
+            let max = fallback.data.iter().flatten().zip(explicit.data.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            // The generated ICC colorants use s15Fixed16 rounding; all other samples/operations agree.
+            assert!(max < 0.00004, "edge {edge}: {max}");
+            let srgb = decode_preview(&bare, Some(PreviewColorSpace::Srgb), edge).unwrap();
+            let unknown = decode_preview(&bare, None, edge).unwrap();
+            assert_eq!(srgb.data, unknown.data, "an sRGB parent keeps the default pixels");
+            assert!(fallback.data.iter().zip(&unknown.data).any(|(a, b)| (a[0] - b[0]).abs() > 0.01));
+        }
+    }
+
+    fn preview_exif_color_space(adobe: bool) -> Vec<u8> {
+        let mut exif = b"II\x2a\0\x08\0\0\0\x01\0".to_vec();
+        // IFD0 points to ExifIFD at byte26; the sRGB case ends after ColorSpace.
+        exif.extend_from_slice(&[0x69, 0x87, 4, 0, 1, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0]);
+        exif.extend_from_slice(&(if adobe { 2u16 } else { 1 }).to_le_bytes());
+        exif.extend_from_slice(&[1, 0xa0, 3, 0, 1, 0, 0, 0]);
+        exif.extend_from_slice(&(if adobe { u16::MAX } else { 1 }).to_le_bytes());
+        exif.extend_from_slice(&[0, 0]);
+        if adobe {
+            exif.extend_from_slice(&[5, 0xa0, 4, 0, 1, 0, 0, 0, 56, 0, 0, 0]);
+        }
+        exif.extend_from_slice(&[0, 0, 0, 0]);
+        if adobe {
+            exif.extend_from_slice(&[1, 0, 1, 0, 2, 0, 4, 0, 0, 0, b'R', b'0', b'3', 0, 0, 0, 0, 0]);
+        }
+        exif
+    }
+
+    #[test]
+    fn camera_preview_embedded_encodings_win_over_parent_hint() {
+        use lightcraft_codecs::{EncodeMeta, NamedSpace};
+        use lightcraft_raw::PreviewColorSpace;
+        let srgb = NamedSpace::Srgb;
+        let icc = lightcraft_codecs::icc::write_matrix_trc(&srgb.rgb_space(), &srgb.trc());
+        let srgb_exif = preview_exif_color_space(false);
+        let adobe_exif = preview_exif_color_space(true);
+        let cases = [
+            (EncodeMeta { icc: Some(&icc), ..Default::default() }, PreviewColorSpace::AdobeRgb),
+            (EncodeMeta { icc: Some(b"malformed ICC"), ..Default::default() }, PreviewColorSpace::AdobeRgb),
+            (EncodeMeta { exif: Some(&srgb_exif), ..Default::default() }, PreviewColorSpace::AdobeRgb),
+            (EncodeMeta { exif: Some(&adobe_exif), ..Default::default() }, PreviewColorSpace::Srgb),
+        ];
+        for (meta, hint) in cases {
+            let jpeg = preview_gradient(meta);
+            for edge in [64, 13] {
+                let own = decode_preview(&jpeg, None, edge).unwrap();
+                let hinted = decode_preview(&jpeg, Some(hint), edge).unwrap();
+                assert_eq!(own.data, hinted.data, "embedded declaration wins at edge {edge}");
+            }
+        }
+        assert!(decode_preview(b"not JPEG", Some(PreviewColorSpace::AdobeRgb), 13).is_none());
+    }
 
     #[test]
     fn linear_arw_gets_a_sensor_proxy_without_demosaicing() {

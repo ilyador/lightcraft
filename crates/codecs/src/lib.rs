@@ -156,6 +156,14 @@ pub fn decode(bytes: &[u8], opts: DecodeOptions) -> Result<Decoded> {
     std::panic::catch_unwind(|| decode_unguarded(bytes, format, &opts)).unwrap_or_else(|_| Err(Error::Malformed(format, "decoder panicked".into())))
 }
 
+/// Decode an embedded JPEG with an optional colour-space declaration from its parent RAW.
+/// The fallback is used only when the JPEG has neither ICC nor a recognised EXIF colour space,
+/// and is applied before linearization and resizing. Ordinary JPEG decoding is unchanged.
+pub fn decode_jpeg_with_color_hint(bytes: &[u8], opts: DecodeOptions, hint: Option<NamedSpace>) -> Result<Decoded> {
+    std::panic::catch_unwind(|| jpeg::decode_with_hint(bytes, &opts, hint))
+        .unwrap_or_else(|_| Err(Error::Malformed(Format::Jpeg, "decoder panicked".into())))
+}
+
 /// [`decode`] without the panic guard (for fuzzing our own code paths).
 #[doc(hidden)]
 pub fn decode_unguarded(bytes: &[u8], format: Format, opts: &DecodeOptions) -> Result<Decoded> {

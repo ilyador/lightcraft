@@ -5,6 +5,39 @@ use lightcraft_tiff::image::chunk_bytes;
 use lightcraft_tiff::tags as t;
 use lightcraft_tiff::{Ifd, Tiff, makernote};
 
+/// The camera-declared encoding of an embedded preview that has no colour metadata of its own.
+/// This describes JPEG samples, never the RAW sensor's colour space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewColorSpace {
+    Srgb,
+    AdobeRgb,
+}
+
+/// Nikon's maker-note `ColorSpace` (`0x001e`: 1 = sRGB, 2 = Adobe RGB) also describes bare embedded
+/// JPEGs whose APP markers carry neither ICC nor EXIF colour metadata. Unknown declarations are
+/// deliberately absent. A preview's own ICC/EXIF declaration must take priority over this hint.
+/// Tag reference: <https://exiftool.org/TagNames/Nikon.html>.
+pub fn embedded_preview_color_space(bytes: &[u8]) -> Option<PreviewColorSpace> {
+    let tiff = Tiff::parse(bytes).ok()?;
+    let make = tiff.find(t::MAKE)?.value.as_str()?;
+    if !make.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("NIKON")) {
+        return None;
+    }
+    let note = tiff.exif()?.get(t::MAKER_NOTE)?;
+    if !note.value.as_bytes()?.starts_with(b"Nikon\0\x02") {
+        return None;
+    }
+    let mn = makernote::parse_makernote(bytes, note.offset, note.count() as u64, tiff.order, &make)?;
+    if mn.kind != makernote::MakerNoteKind::NikonV3 {
+        return None;
+    }
+    match mn.ifd.u16(0x001e) {
+        Some(1) => Some(PreviewColorSpace::Srgb),
+        Some(2) => Some(PreviewColorSpace::AdobeRgb),
+        _ => None,
+    }
+}
+
 /// Whether `b` looks like a displayable (DCT) JPEG: SOI, and the first SOF marker is not lossless.
 fn is_dct_jpeg(b: &[u8]) -> bool {
     if b.len() < 4 || b[0] != 0xff || b[1] != 0xd8 {
@@ -144,6 +177,70 @@ fn trim_eoi(s: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use lightcraft_tiff::{IfdBuilder, ImageData, TiffWriter, Value};
+
+    fn with_preview_note(order: lightcraft_tiff::ByteOrder, note: Vec<u8>, make: &str) -> Vec<u8> {
+        let mut exif = IfdBuilder::new();
+        exif.set(t::MAKER_NOTE, Value::Undefined(note));
+        let mut ifd0 = IfdBuilder::new();
+        ifd0.set(t::MAKE, Value::Ascii(make.into()));
+        ifd0.set(t::MODEL, Value::Ascii("procedural camera".into()));
+        ifd0.set_child(t::EXIF_IFD, exif);
+        TiffWriter::new(order, false).write(&[ifd0]).unwrap()
+    }
+
+    #[test]
+    fn nikon_preview_color_space_is_model_independent_and_bounded() {
+        use lightcraft_tiff::ByteOrder;
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            for (value, expected) in [(1, Some(PreviewColorSpace::Srgb)), (2, Some(PreviewColorSpace::AdobeRgb)), (3, None)] {
+                let mut note = b"Nikon\0\x02\x10\0\0".to_vec();
+                note.extend_from_slice(if order == ByteOrder::Little { b"II" } else { b"MM" });
+                order.put_u16(&mut note, 42);
+                order.put_u32(&mut note, 8);
+                order.put_u16(&mut note, 1);
+                order.put_u16(&mut note, 0x001e);
+                order.put_u16(&mut note, 3);
+                order.put_u32(&mut note, 1);
+                order.put_u16(&mut note, value);
+                order.put_u16(&mut note, 0);
+                order.put_u32(&mut note, 0);
+                for make in ["NIKON CORPORATION", "NIKON", "OTHER"] {
+                    let bytes = with_preview_note(order, note.clone(), make);
+                    assert_eq!(embedded_preview_color_space(&bytes), if make == "OTHER" { None } else { expected });
+                    for end in 0..bytes.len() {
+                        let _ = embedded_preview_color_space(&bytes[..end]);
+                    }
+                }
+            }
+        }
+        assert_eq!(embedded_preview_color_space(b"not a TIFF"), None);
+    }
+
+    #[test]
+    fn preview_color_space_rejects_other_maker_note_dialects_and_versions() {
+        use lightcraft_tiff::ByteOrder;
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut ifd = Vec::new();
+            order.put_u16(&mut ifd, 1);
+            order.put_u16(&mut ifd, 0x001e);
+            order.put_u16(&mut ifd, 3);
+            order.put_u32(&mut ifd, 1);
+            order.put_u16(&mut ifd, 2);
+            order.put_u16(&mut ifd, 0);
+            order.put_u32(&mut ifd, 0);
+            for header in [b"".as_slice(), b"Nikon\0\x01\0", b"SONY DSC \0\0\0", b"Nikon\0\x03\x10\0\0"] {
+                let mut note = header.to_vec();
+                if header.starts_with(b"Nikon\0\x03") {
+                    note.extend_from_slice(if order == ByteOrder::Little { b"II" } else { b"MM" });
+                    order.put_u16(&mut note, 42);
+                    order.put_u32(&mut note, 8);
+                }
+                note.extend_from_slice(&ifd);
+                let bytes = with_preview_note(order, note, "NIKON CORPORATION");
+                assert_eq!(embedded_preview_color_space(&bytes), None);
+            }
+        }
+    }
 
     fn fake_jpeg(n: usize) -> Vec<u8> {
         let mut j = vec![0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 8, 0, 1, 0, 1, 1, 1, 0x11, 0];

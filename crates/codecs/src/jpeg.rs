@@ -105,6 +105,10 @@ pub(crate) fn parse_markers(b: &[u8]) -> Option<Markers> {
 }
 
 pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
+    decode_with_hint(bytes, opts, None)
+}
+
+pub(crate) fn decode_with_hint(bytes: &[u8], opts: &DecodeOptions, hint: Option<crate::NamedSpace>) -> Result<Decoded> {
     let m = parse_markers(bytes).ok_or_else(|| Error::Malformed(F, "missing SOI".into()))?;
     if m.components == 0 {
         return Err(Error::Malformed(F, "no frame header".into()));
@@ -119,7 +123,10 @@ pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
     } else {
         decode_zune(bytes, &m)?
     };
-    let meta = Meta { icc: m.icc, exif: m.exif, xmp: m.xmp, ..Default::default() };
+    let own_space = m.exif.as_deref().map(crate::exif::summarize).is_some_and(|s| s.srgb_hint || s.adobe_rgb_hint);
+    let fallback =
+        if m.icc.is_none() && !own_space { hint.map(|space| crate::SourceSpace::named(space, crate::SpaceOrigin::Container)) } else { None };
+    let meta = Meta { icc: m.icc, exif: m.exif, xmp: m.xmp, hint: fallback, ..Default::default() };
     finish(F, raw, meta, (m.width, m.height), opts)
 }
 
