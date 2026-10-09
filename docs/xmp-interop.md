@@ -112,7 +112,7 @@ names are read (e.g. `Exposure2012`, not the older `Exposure`).
 | `Vibrance`, `Saturation` | `color.vibrance`, `color.saturation` | 1:1 |
 | `Texture`, `Clarity2012`, `Dehaze` | `effects.texture`, `effects.clarity`, `effects.dehaze` | 1:1 |
 | `HueAdjustment<Band>`, `SaturationAdjustment<Band>`, `LuminanceAdjustment<Band>` | `mixer.<band>.hue/sat/lum` | bands Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta |
-| `ConvertToGrayscale` | `treatment` | `True` → B&W |
+| `ConvertToGrayscale` | `treatment` | `True` → B&W; also reads an explicit `Look/Parameters/ConvertToGrayscale` when the outer flag is absent. Other Look parameters remain unsupported. |
 | `GrayMixer<Band>` | `bw_mix.<band>` | |
 | `ParametricShadows`, `ParametricDarks`, `ParametricLights`, `ParametricHighlights` | `curve.shadows/darks/lights/highlights` | |
 | `ParametricShadowSplit`, `ParametricMidtoneSplit`, `ParametricHighlightSplit` | `curve.split_shadows/split_mid/split_highlights` | |

@@ -117,7 +117,7 @@ pub(crate) fn profile_pairs(raw: &RawImage, bytes: &[u8]) -> Option<Vec<([f64; 3
     let transform = lightcraft_raw::color::camera_transform(raw, lightcraft_raw::color::as_shot_white_xy(raw));
     let (sensor, reference) = proxies(raw, bytes, &transform, PROFILE_PROXY)?;
     let to_camera = transform.matrix.inverse()?;
-    let (pairs, _) = collect_pairs(&sensor, &reference)?;
+    let (pairs, _, _) = collect_pairs(&sensor, &reference)?;
     Some(pairs.into_iter().map(|(x, y)| (to_camera.apply(x), y)).collect())
 }
 
@@ -165,18 +165,19 @@ fn fit_pairs(sensor: &Rgb32f, reference: &Rgb32f) -> Option<CameraLook> {
     fit_pairs_with(sensor, reference, None)
 }
 
-/// Training pairs (sensor → JPEG, unclipped midtones) and the wider set including highlights
-/// (for the chroma curve); `None` when too few, or the photo has too little colour.
+/// Colour pairs (sensor → JPEG, unclipped midtones), chroma pairs including highlights, and
+/// tone training pairs including shadows; `None` when too few, or the photo has too little colour.
 type Pairs = Vec<([f64; 3], [f64; 3])>;
-fn collect_pairs(sensor: &Rgb32f, reference: &Rgb32f) -> Option<(Pairs, Pairs)> {
+fn collect_pairs(sensor: &Rgb32f, reference: &Rgb32f) -> Option<(Pairs, Pairs, Pairs)> {
     if (sensor.width, sensor.height) != (reference.width, reference.height) || sensor.data.len() != reference.data.len() {
         return None;
     }
     let mut pairs = Vec::new();
     // Highlights too (camera JPEGs bleach colours toward white there), for the chroma curve only.
     let mut bright = Vec::new();
+    let mut tone = Vec::new();
     let mut colour = 0;
-    for (input, output) in sensor.data.iter().zip(&reference.data) {
+    for (pixel, (input, output)) in sensor.data.iter().zip(&reference.data).enumerate() {
         let y = luminance_2020(*output);
         if !input.iter().all(|v| v.is_finite() && *v > 0.001 && *v < 1.5) || !output.iter().all(|v| v.is_finite() && *v >= 0.0) {
             continue;
@@ -184,7 +185,16 @@ fn collect_pairs(sensor: &Rgb32f, reference: &Rgb32f) -> Option<(Pairs, Pairs)> 
         if (0.015..=1.0).contains(&y) {
             bright.push((input.map(f64::from), output.map(f64::from)));
         }
-        if !output.iter().all(|v| *v > 0.004 && *v < 0.98) || !(0.015..0.85).contains(&y) {
+        let colour_pair = output.iter().all(|v| *v > 0.004 && *v < 0.98) && (0.015..0.85).contains(&y);
+        // The colour fit excludes shadows because normalising near-black RGB is unstable.
+        // Tone fitting must retain them: a curve learned only from brighter pixels extrapolates
+        // across most of a dark photo and can pool its few noisy medians into long plateaus.
+        // Preserve the colour fit's existing held-out identities when adding shadow samples.
+        let training = if colour_pair { pairs.len() % 3 != 0 } else { pixel % 3 != 0 };
+        if training && output.iter().all(|v| *v < 0.98) {
+            tone.push((input.map(f64::from), output.map(f64::from)));
+        }
+        if !colour_pair {
             continue;
         }
         let min = output.iter().copied().fold(f32::INFINITY, f32::min);
@@ -192,7 +202,7 @@ fn collect_pairs(sensor: &Rgb32f, reference: &Rgb32f) -> Option<(Pairs, Pairs)> 
         colour += usize::from(max - min > 0.05);
         pairs.push((input.map(f64::from), output.map(f64::from)));
     }
-    (pairs.len() >= 256 && colour >= pairs.len() / 20).then_some((pairs, bright))
+    (pairs.len() >= 256 && colour >= pairs.len() / 20).then_some((pairs, bright, tone))
 }
 
 /// Ridge-regularised 3×3 chromaticity matrix (luminance-normalised RGB) on the training pairs.
@@ -234,7 +244,7 @@ fn fit_matrix(pairs: &[([f64; 3], [f64; 3])]) -> Option<Mat3> {
 /// colour model (a camera profile's, in the sensor proxy's space), each completed with a tone
 /// and chroma curve fitted to this photo.
 fn fit_pairs_with(sensor: &Rgb32f, reference: &Rgb32f, colour: Option<(Mat3, Option<HsvTable>)>) -> Option<CameraLook> {
-    let (pairs, bright) = collect_pairs(sensor, reference)?;
+    let (pairs, bright, tone_training) = collect_pairs(sensor, reference)?;
     let candidates = match colour {
         Some(given) => vec![given],
         None => {
@@ -253,7 +263,7 @@ fn fit_pairs_with(sensor: &Rgb32f, reference: &Rgb32f, colour: Option<(Mat3, Opt
             correction.as_ref().map_or(p, |c| c.apply(p.map(|v| v as f32)).map(f64::from))
         };
         let tone_pairs: Vec<_> =
-            pairs.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, (x, y))| (luma(colour(*x).map(|v| v.max(0.0))), luma(*y))).collect();
+            tone_training.iter().map(|(x, y)| (luma(colour(*x).map(|v| v.max(0.0))), luma(*y))).filter(|(x, _)| x.is_finite() && *x > 0.0).collect();
         let Some(curve) = fit_tone(tone_pairs) else { continue };
         let mut look = CameraLook { matrix, tone: curve, hue_sat: hue_sat.clone() };
         if let Some(tone) = fit_chroma(&bright, &look) {
@@ -723,6 +733,65 @@ mod tests {
         let p = fit.matrix.apply([2.0, 2.0, 2.0]);
         assert!(luma(p) > 1.0);
         assert!(tone.apply(0.2) < tone.apply(0.4));
+    }
+
+    fn shadow_dominated_reference() -> (Rgb32f, Rgb32f) {
+        let mut sensor = Rgb32f::new(96, 64);
+        let mut reference = sensor.clone();
+        for (i, (src, dst)) in sensor.data.iter_mut().zip(&mut reference.data).enumerate() {
+            // A camera curve y -> y², with many well-exposed sensor shadows and a few
+            // brighter coloured objects. Shadows cannot train a normalised colour fit.
+            let ev = if i % 10 == 0 { 0.25 + (i % 97) as f32 * 0.004 } else { 0.006 + (i % 101) as f32 * 0.001 };
+            *src = [ev * (0.7 + (i % 13) as f32 * 0.04), ev, ev * (0.7 + (i % 17) as f32 * 0.03)];
+            let y = luminance_2020(*src);
+            *dst = src.map(|v| v * y);
+        }
+        (sensor, reference)
+    }
+
+    #[test]
+    fn tone_fit_uses_shadows_without_changing_the_given_colour_model() {
+        let (sensor, reference) = shadow_dominated_reference();
+        let original = sensor.clone();
+        let look = fit_pairs_with(&sensor, &reference, Some((Mat3::IDENTITY, None))).unwrap();
+        assert_eq!(look.matrix, Mat3::IDENTITY);
+        assert!(look.hue_sat.is_none());
+        assert_eq!(sensor.data, original.data, "tone calibration does not alter scene-linear samples");
+        let tone = ToneMap::camera(&look.tone, 0.0, 0.0, 0.0);
+        let error = sensor
+            .data
+            .iter()
+            .zip(&reference.data)
+            .filter(|(_, target)| luminance_2020(**target) < 0.015)
+            .map(|(src, target)| f64::from(tone.apply(luminance_2020(*src)) - luminance_2020(*target)).powi(2))
+            .sum::<f64>()
+            / reference.data.iter().filter(|p| luminance_2020(**p) < 0.015).count() as f64;
+        assert!(error.sqrt() < 0.0001, "shadow RMS {}", error.sqrt());
+        // The known curve quadruples output luminance across this stop. Extrapolating
+        // from colour midtones instead doubles it and loses the shadow contrast.
+        let ratio = tone.apply(0.06) / tone.apply(0.03);
+        assert!((3.8..4.2).contains(&ratio), "shadow contrast {ratio}");
+        assert_eq!(tone.apply(0.0), 0.0);
+        assert!(tone.apply(2.0) > tone.apply(1.0), "unobserved sensor headroom survives");
+    }
+
+    #[test]
+    fn broader_tone_training_excludes_colour_holdout_and_invalid_samples() {
+        let (mut sensor, mut reference) = shadow_dominated_reference();
+        sensor.data[1] = [f32::NAN, 0.2, 0.3];
+        sensor.data[2] = [0.0, 0.2, 0.3];
+        sensor.data[3] = [1.6, 0.2, 0.3];
+        reference.data[4] = [f32::INFINITY, 0.2, 0.3];
+        reference.data[5] = [-0.01, 0.2, 0.3];
+        reference.data[6] = [1.0, 0.2, 0.3];
+        let (colour, _, tone) = collect_pairs(&sensor, &reference).unwrap();
+        for pair in colour.iter().step_by(3) {
+            assert!(!tone.contains(pair), "a colour holdout pixel cannot train the tone curve");
+        }
+        assert!(tone.iter().any(|(_, target)| luma(*target) < 0.015), "reference shadows train the curve");
+        assert!(tone.iter().all(|(source, target)| {
+            source.iter().all(|v| v.is_finite() && *v > 0.001 && *v < 1.5) && target.iter().all(|v| v.is_finite() && *v >= 0.0 && *v < 0.98)
+        }));
     }
     #[test]
     fn accepts_a_much_better_fit_despite_local_camera_processing() {
